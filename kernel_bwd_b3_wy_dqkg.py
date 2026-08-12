@@ -171,6 +171,24 @@ def wy_dqkg_backward_formula_full(q_c, k_c, b_c, w_c, v_c, gc, A, Akk, h_pre,
     dk = dk_from_kb + dk_from_kg
     dgc = dgc_from_kb + dgc_from_qg + dgc_from_kg
     dgc = dgc.at[-1].add(dgc_last_contrib)
+
+    # ФИКС (найдено реальным TPU end-to-end тестом, test_kernel_bwd_b3.py --
+    # dgc был ошибочен на ~20-25% при том что dq/dk/db/dw/dv_raw/dAkk были
+    # точны до ~1e-7; изолированный однo-чанковый CPU-тест этого не поймал,
+    # т.к. в нём _piece2_forward считал только write=kg^T@v_new, а не полное
+    # h_new = h_pre*decay_h + write). gc_last используется ДВАЖДЫ в forward:
+    # (1) kg = k*exp(gc_last-gc) -- уже учтено выше (dgc_from_kg/dgc_last_
+    # contrib); (2) decay_h = exp(gc_last), которым домножается h_pre при
+    # переходе state в h_new = h_pre*decay_h + write -- ПРОПУЩЕНО было
+    # полностью. d(h_new[d,:])/d(gc_last[d]) = h_pre[d,:]*decay_h[d], так
+    # что d(Loss)/d(gc_last[d]) += decay_h[d] * sum_v(dh_next[d,v]*h_pre[d,v]).
+    # Тот же h_pre/dh_next, что уже передаются в эту функцию -- просто ещё
+    # одна независимая ветка chain rule через ту же переменную, добавляется
+    # в ту же последнюю строку dgc, что и dgc_last_contrib от kg.
+    gc_last = gc[-1]
+    decay_h = jnp.exp(gc_last)  # (D,)
+    dgc_last_from_decay = decay_h * jnp.sum(dh_next * h_pre, axis=-1)  # (D,)
+    dgc = dgc.at[-1].add(dgc_last_from_decay)
     # NOTE for the future Pallas port: `.at[].add()` is fine here (plain
     # JAX, not inside a Pallas kernel body). Once this is ported to Pallas,
     # per project lesson #9 (see HANDOFF.md sec 5), this single-row add on a
