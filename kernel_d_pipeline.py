@@ -18,9 +18,9 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from .kernel_a_scores import build_chunk_scores_pallas, BT
-from .kernel_b_solve import wy_solve_pallas
-from .kernel_c_recompute import recompute_wy_pallas
+from kernel_a_scores import build_chunk_scores_pallas, BT
+from kernel_b_solve import wy_solve_pallas
+from kernel_c_recompute import recompute_wy_pallas
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 
