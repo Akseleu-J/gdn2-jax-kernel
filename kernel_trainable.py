@@ -24,9 +24,9 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from atomic_ops.kernel_a_scores import BT
-from atomic_ops.kernel_d_pipeline import gdn2_pallas_forward
-from atomic_ops.gdn2_wy_reference import gdn2_chunked_wy_reference
+from kernel_a_scores import BT
+from kernel_d_pipeline import gdn2_pallas_forward
+from gdn2_wy_reference import gdn2_chunked_wy_reference
 
 @partial(jax.custom_vjp, nondiff_argnums=(6,))
 def _gdn2_core(q, k, v, w, b, g, scale, h0):
