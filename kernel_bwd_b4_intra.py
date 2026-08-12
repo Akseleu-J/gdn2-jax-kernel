@@ -85,10 +85,28 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
 
     bk_full = b_full * k_full
 
-    dq_acc = jnp.zeros_like(q_full)
-    dk_acc = jnp.zeros_like(k_full)
-    dbk_acc = jnp.zeros_like(k_full)
-    dgc_acc = jnp.zeros_like(g_raw)
+    # ФИКС (после реального прогона на TPU): `.at[].add()` on plain JAX
+    # values -- even with fully STATIC slice bounds -- lowers to the
+    # `scatter-add` primitive, which Mosaic/Pallas-TPU does not implement
+    # ("Unimplemented primitive in Pallas TPU lowering for tc: scatter-add").
+    # Kernel A/B/C never hit this because they only ever WRITE ONCE to each
+    # disjoint sub-block region of an output ref -- no accumulation. Here we
+    # genuinely need to accumulate across MULTIPLE (si,sj) pairs into the
+    # same (BC,D) region (e.g. dq's si=1 sub-block gets contributions from
+    # BOTH (1,0) and (1,1)). Fix: accumulate via explicit ref
+    # read-modify-write (load, add, store -- all with static slices), which
+    # is just two independent load/store ops, NOT a scatter primitive --
+    # exactly the same ref-slice pattern already proven to work in Kernel
+    # A/B/C, just done twice (read then write) instead of once (write only).
+    #
+    # db's "dbk" (b*k-side accumulator, needs a final *k multiply after the
+    # loop) reuses db_ref itself as scratch during the loop -- avoids adding
+    # a 5th output tensor. Overwritten with the real db value only after
+    # dbk's final accumulated value has been read out.
+    dq_ref[0, 0, 0] = jnp.zeros_like(q_full)
+    dk_ref[0, 0, 0] = jnp.zeros_like(k_full)
+    db_ref[0, 0, 0] = jnp.zeros_like(k_full)   # scratch: accumulates dbk here during the loop
+    dgc_ref[0, 0, 0] = jnp.zeros_like(g_raw)
 
     for si in range(N_SUB):
         for sj in range(si + 1):
@@ -129,24 +147,27 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
             dR_kk = _dR_pair_sum(dM_kk, edecay, L_kk)
             dgc_i_kk, dgc_j_kk = _dgc_pair_sum(dM_kk, edecay, L_kk, R_kk, clipmask)
 
-            dq_acc = dq_acc.at[i0:i1].add(dL_qk * scale)
-            dbk_acc = dbk_acc.at[i0:i1].add(dL_kk)
-            dk_acc = dk_acc.at[j0:j1].add(dR_qk + dR_kk)
-            dgc_acc = dgc_acc.at[i0:i1].add(dgc_i_qk + dgc_i_kk)
-            dgc_acc = dgc_acc.at[j0:j1].add(dgc_j_qk + dgc_j_kk)
+            dq_ref[0, 0, 0, i0:i1] = dq_ref[0, 0, 0, i0:i1] + dL_qk * scale
+            db_ref[0, 0, 0, i0:i1] = db_ref[0, 0, 0, i0:i1] + dL_kk  # scratch: dbk accumulator
+            dk_ref[0, 0, 0, j0:j1] = dk_ref[0, 0, 0, j0:j1] + dR_qk + dR_kk
+            dgc_ref[0, 0, 0, i0:i1] = dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk
+            dgc_ref[0, 0, 0, j0:j1] = dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk
 
-    db_acc = dbk_acc * k_full
-    dk_acc = dk_acc + dbk_acc * b_full
+    dbk_final = db_ref[0, 0, 0]           # fully-accumulated dbk, read back out of the scratch
+    dk_final = dk_ref[0, 0, 0] + dbk_final * b_full
+    db_final = dbk_final * k_full
+    dq_final = dq_ref[0, 0, 0]
+    dgc_final = dgc_ref[0, 0, 0]
 
     # ФИКС (см. HANDOFF.md §6 / BACKWARD_PLAN.md incident): same backward-side
     # sanitization convention used throughout this project's backward pieces
     # (kernel_bwd_b1_dhu.py, kernel_b_solve.py etc.) -- non-finite upstream
     # dAqk/dAkk (from B2/B3) or an exploded edecay term should not silently
     # propagate NaN into dq/dk/db/dgc.
-    dq_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dq_acc, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
-    dk_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dk_acc, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
-    db_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(db_acc, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
-    dgc_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dgc_acc, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
+    dq_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dq_final, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
+    dk_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dk_final, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
+    db_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(db_final, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
+    dgc_ref[0, 0, 0] = jnp.nan_to_num(jnp.clip(dgc_final, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale):
