@@ -66,7 +66,7 @@ from kernel_bwd_b1_dhu import gdn2_dhu_backward
 from kernel_bwd_b2_dav import dav_backward_pallas
 from kernel_bwd_b3_wy_dqkg import wy_dqkg_backward_pallas
 from kernel_bwd_b4_intra import intra_backward_pallas
-from kernel_bwd_b5_revcumsum import reverse_cumsum_pallas
+from kernel_bwd_b5_reverse_cumsum import reverse_cumsum_pallas
 
 _HIGHEST = jax.lax.Precision.HIGHEST
 
