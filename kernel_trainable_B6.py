@@ -159,7 +159,7 @@ def _gdn2_core_bwd(scale, residuals, cotangents):
     dq4, dk4, db4, dgc4 = intra_backward_pallas(dAqk, b3_out["dAkk"], q, k, b, g, scale)
 
     dgc_total = b3_out["dgc"] + dgc4
-    dg_raw = reverse_cumsum_pallas(dgc_total)
+    dg_raw = reverse_cumsum_bwd(dgc_total, chunk_size=BT)
 
     dq = _reshape_out(b3_out["dq"] + dq4)
     dk = _reshape_out(b3_out["dk"] + dk4)
