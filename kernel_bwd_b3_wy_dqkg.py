@@ -185,8 +185,7 @@ def wy_dqkg_backward_formula_full(q_c, k_c, b_c, w_c, v_c, gc, A, Akk, h_pre,
     # Тот же h_pre/dh_next, что уже передаются в эту функцию -- просто ещё
     # одна независимая ветка chain rule через ту же переменную, добавляется
     # в ту же последнюю строку dgc, что и dgc_last_contrib от kg.
-    gc_last = gc[-1]
-    decay_h = jnp.exp(gc_last)  # (D,)
+    decay_h = jnp.exp(gc_last)  # (D,) -- gc_last already computed at top of function
     dgc_last_from_decay = decay_h * jnp.sum(dh_next * h_pre, axis=-1)  # (D,)
     dgc = dgc.at[-1].add(dgc_last_from_decay)
     # NOTE for the future Pallas port: `.at[].add()` is fine here (plain
@@ -259,14 +258,36 @@ def _piece2_forward(k_, gc_, v_new_):
     return write
 
 
+def _piece3_forward(gc_, h_pre_):
+    """decay_h * h_pre ONLY -- the OTHER place gc_last appears in the real
+    forward, via h_new = h_pre*decay_h + write (decay_h = exp(gc_last)).
+
+    THIS PIECE WAS MISSING from the original version of this test, which is
+    exactly how the missing dgc_last_from_decay term in
+    wy_dqkg_backward_formula_full slipped past the CPU check and only
+    surfaced on a real TPU end-to-end run (test_kernel_bwd_b3.py, dgc off
+    by ~20-25% while every other output matched to 1e-7 -- see chat).
+    gc_last's gradient has TWO independent sources in the real forward
+    (kg=k*exp(gc_last-gc) via piece2, AND this decay term) -- both must be
+    summed into dgc's last row. `write` itself (the v_new-dependent part of
+    h_new) stays in piece2, kept separate for the same double-counting
+    reason documented on _piece1_forward.
+    """
+    gc_last_ = gc_[-1]
+    decay_h_ = jnp.exp(gc_last_)[:, None]
+    h_new_decay = h_pre_ * decay_h_
+    return h_new_decay
+
+
 def verify_wy_dqkg_backward(key, C=8, D=6, Dv=5, scale=0.7, akk_scale=0.05):
     """Pure-JAX/numpy sanity check (no Pallas, no TPU needed): the hand-
     derived wy_dqkg_backward_formula_full must match jax.vjp, split into
-    two independent isolated pieces (_piece1_forward, _piece2_forward) to
-    avoid the double-counting trap documented on _piece1_forward -- each
-    piece is checked against jax.vjp separately, then the formula's summed
-    outputs (dk = dk_from_kb+dk_from_kg, dgc = ...) are compared against the
-    SUM of both pieces' reference gradients for that quantity.
+    three independent isolated pieces (_piece1_forward, _piece2_forward,
+    _piece3_forward) to avoid the double-counting trap documented on
+    _piece1_forward -- each piece is checked against jax.vjp separately,
+    then the formula's summed outputs (dk = dk_from_kb+dk_from_kg, dgc =
+    dgc_from_kb+dgc_from_qg+dgc_from_kg+dgc_last_from_decay, ...) are
+    compared against the SUM of the relevant pieces' reference gradients.
 
     akk_scale keeps Akk small so (I+Akk) stays well-conditioned for this
     correctness check -- this is about validating the ALGEBRA, not stress-
@@ -293,7 +314,13 @@ def verify_wy_dqkg_backward(key, C=8, D=6, Dv=5, scale=0.7, akk_scale=0.05):
 
     do = jax.random.normal(keys[8], (C, Dv))
     dv_up = jax.random.normal(keys[9], (C, Dv))       # injected as TOTAL dL/d(v_new)
-    dh_next = jax.random.normal(keys[10], (D, Dv))    # injected as dL/d(write)
+    dh_next = jax.random.normal(keys[10], (D, Dv))    # injected as dL/d(h_new)
+    # NOTE: dh_next is injected identically as the cotangent on BOTH piece2's
+    # `write` and piece3's `h_new_decay`, since in the real forward they're
+    # the two additive halves of the SAME h_new = h_pre*decay_h + write, and
+    # d(Loss)/d(each half) = dL/d(h_new) = dh_next for both -- not a
+    # double-count, since piece2 and piece3 have disjoint leaf sets (piece2:
+    # k, gc, v_new_val; piece3: gc, h_pre) and disjoint output quantities.
 
     # --- piece 1: qh, v_new (through A) ---
     fwd1 = lambda *a: _piece1_forward(*a, scale=scale)
@@ -318,8 +345,14 @@ def verify_wy_dqkg_backward(key, C=8, D=6, Dv=5, scale=0.7, akk_scale=0.05):
     )
     dk2_ref, dgc2_ref, dv_new_from_write_ref = vjp_fn2((dh_next,))
 
+    # --- piece 3: h_new's decay term, the one that was missing ---
+    (h_new_decay_val,), vjp_fn3 = jax.vjp(
+        lambda gc_, h_pre_: (_piece3_forward(gc_, h_pre_),), gc, h_pre
+    )
+    dgc3_ref, dh_pre_ref3 = vjp_fn3((dh_next,))
+
     dk_ref = dk1_ref + dk2_ref
-    dgc_ref = dgc1_ref + dgc2_ref
+    dgc_ref = dgc1_ref + dgc2_ref + dgc3_ref
 
     A_val = jnp.linalg.inv(jnp.eye(C) + Akk)
     out = wy_dqkg_backward_formula_full(
@@ -477,21 +510,33 @@ def _kernel_b3_body(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref, akk_ref,
     dk = dk_from_kb + dk_from_kg
     dgc = dgc_from_kb + dgc_from_qg + dgc_from_kg  # last-row gc_last contribution NOT yet added
 
-    # ФИКС (найдено на реальном TPU-прогоне, см. чат): изначальная версия
-    # писала dgc_ref целиком, затем читала СРЕЗ последней строки обратно из
-    # того же output ref и дописывала dgc_last_contrib -- этот read-after-
-    # write на output ref не сработал надёжно (dgc был единственным
-    # неверным выходом, ошибка ~0.2, похоже на то что добавка просто не
-    # применялась/не читалась обратно). Тот класс операций (read-modify-
-    # write на ref), что сработал в kernel_bwd_b4_intra.py, был на SCRATCH-
-    # аккумуляторе внутри цикла (несколько записей до финального чтения),
-    # а не сразу-после-полной-записи-output-блока, как здесь -- разные
-    # ситуации. Исправлено на уже проверенный паттерн из kernel_b_solve.py:
-    # one-hot маска по строкам + умножение/сумма, ЦЕЛИКОМ на уровне
-    # значений, ДО единственной записи в ref -- никакого чтения из output
-    # ref вообще не требуется.
+    # ФИКС (найдено реальным TPU end-to-end тестом, test_kernel_bwd_b3.py --
+    # dgc был ошибочен на ~20-25% при том что dq/dk/db/dw/dv_raw/dAkk были
+    # точны до ~1e-7; см. тот же комментарий в wy_dqkg_backward_formula_full
+    # выше). gc_last используется ДВАЖДЫ в forward: (1) kg=k*exp(gc_last-gc)
+    # -- уже учтено в dgc_from_kg/dgc_last_contrib; (2) decay_h=exp(gc_last),
+    # которым домножается h_pre при переходе state в h_new=h_pre*decay_h+write
+    # -- было пропущено полностью. d(h_new[d,:])/d(gc_last[d]) =
+    # h_pre[d,:]*decay_h[d], так что d(Loss)/d(gc_last[d]) +=
+    # decay_h[d]*sum_v(dh_next[d,v]*h_pre[d,v]).
+    decay_h_row = jnp.exp(gc_last)  # (D,)
+    dgc_last_from_decay = decay_h_row * jnp.sum(dh_next * h_pre, axis=-1)  # (D,)
+    dgc_last_total = dgc_last_contrib + dgc_last_from_decay
+
+    # ФИКС (Mosaic-specific, found on real TPU run): an earlier version
+    # wrote dgc_ref fully, then read a SLICE of the last row back from that
+    # same output ref and wrote the addition back -- that read-after-write
+    # on an output ref did not reliably reflect the just-written data (dgc
+    # came back wrong, ~0.2 rel err, while nothing else did). The
+    # read-modify-write pattern that DID work in kernel_bwd_b4_intra.py was
+    # on a SCRATCH accumulator touched multiple times before a final read,
+    # not immediately-after-a-full-block-write-to-output, a different
+    # situation. Fixed by avoiding any ref read entirely: add the last-row
+    # contribution via a one-hot row mask (broadcast multiply), fully at
+    # the value level, before the single write to dgc_ref -- same safe
+    # pattern already used in kernel_b_solve.py's forward substitution.
     row_mask = (idx == (C - 1)).astype(jnp.float32)[:, None]  # (BT,1), 1 only at last row
-    dgc = dgc + row_mask * dgc_last_contrib[None, :]
+    dgc = dgc + row_mask * dgc_last_total[None, :]
 
     dq_ref[0, 0, 0] = jnp.nan_to_num(dq, nan=0.0, posinf=1e4, neginf=-1e4)
     dk_ref[0, 0, 0] = jnp.nan_to_num(dk, nan=0.0, posinf=1e4, neginf=-1e4)
