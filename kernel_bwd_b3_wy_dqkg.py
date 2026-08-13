@@ -385,13 +385,21 @@ if __name__ == "__main__":
 # (single head dim -- see gdn2_wy_reference.py's own docstring), so D==Dv
 # throughout; only one (BT,D) BlockSpec is needed for q/k/b/w/v/do/dv/etc.
 #
-# The one real Mosaic trap here (lesson #9, kernel_bwd_b4_intra.py): the
-# formula's dgc = ... ; dgc[-1] += sum_i(dx) step. `.at[-1].add(...)` on a
-# plain JAX value is a scatter-add -- doesn't lower on Mosaic even with a
-# fully static index. Fixed the same way B4 fixed it: write dgc to the
-# output ref first, then do an explicit read-modify-write on JUST the last
-# row of the ref (load, add, store -- two ordinary ops, not a scatter
-# primitive).
+# The one real Mosaic trap here: the formula's dgc = ... ; dgc[-1] +=
+# sum_i(dx) step. `.at[-1].add(...)` on a plain JAX value is a scatter-add
+# -- doesn't lower on Mosaic even with a fully static index (lesson #9).
+# An EARLIER version of this port tried a ref read-modify-write instead
+# (write dgc_ref fully, then read back just the last row, add, write back)
+# -- that pattern works fine for a SCRATCH accumulator touched multiple
+# times before a final read (as in kernel_bwd_b4_intra.py), but reading
+# back from an OUTPUT ref immediately after a full-block write to that same
+# ref did NOT reliably reflect the just-written data on real TPU (found via
+# a real test run -- dgc was silently wrong, ~0.2 rel err, while every other
+# output matched to 1e-7; see chat). Fixed by avoiding any ref read-after-
+# write for this: the last-row contribution is added via a one-hot row mask
+# (broadcast multiply) at the VALUE level, before the single write to
+# dgc_ref -- same safe pattern already used in kernel_b_solve.py's forward
+# substitution.
 # ==========================================================================
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -469,24 +477,29 @@ def _kernel_b3_body(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref, akk_ref,
     dk = dk_from_kb + dk_from_kg
     dgc = dgc_from_kb + dgc_from_qg + dgc_from_kg  # last-row gc_last contribution NOT yet added
 
+    # ФИКС (найдено на реальном TPU-прогоне, см. чат): изначальная версия
+    # писала dgc_ref целиком, затем читала СРЕЗ последней строки обратно из
+    # того же output ref и дописывала dgc_last_contrib -- этот read-after-
+    # write на output ref не сработал надёжно (dgc был единственным
+    # неверным выходом, ошибка ~0.2, похоже на то что добавка просто не
+    # применялась/не читалась обратно). Тот класс операций (read-modify-
+    # write на ref), что сработал в kernel_bwd_b4_intra.py, был на SCRATCH-
+    # аккумуляторе внутри цикла (несколько записей до финального чтения),
+    # а не сразу-после-полной-записи-output-блока, как здесь -- разные
+    # ситуации. Исправлено на уже проверенный паттерн из kernel_b_solve.py:
+    # one-hot маска по строкам + умножение/сумма, ЦЕЛИКОМ на уровне
+    # значений, ДО единственной записи в ref -- никакого чтения из output
+    # ref вообще не требуется.
+    row_mask = (idx == (C - 1)).astype(jnp.float32)[:, None]  # (BT,1), 1 only at last row
+    dgc = dgc + row_mask * dgc_last_contrib[None, :]
+
     dq_ref[0, 0, 0] = jnp.nan_to_num(dq, nan=0.0, posinf=1e4, neginf=-1e4)
     dk_ref[0, 0, 0] = jnp.nan_to_num(dk, nan=0.0, posinf=1e4, neginf=-1e4)
     db_ref[0, 0, 0] = jnp.nan_to_num(db, nan=0.0, posinf=1e4, neginf=-1e4)
     dw_ref[0, 0, 0] = jnp.nan_to_num(dw, nan=0.0, posinf=1e4, neginf=-1e4)
     dvraw_ref[0, 0, 0] = jnp.nan_to_num(dv_raw, nan=0.0, posinf=1e4, neginf=-1e4)
     dakk_ref[0, 0, 0] = jnp.nan_to_num(dAkk, nan=0.0, posinf=1e4, neginf=-1e4)
-
     dgc_ref[0, 0, 0] = jnp.nan_to_num(dgc, nan=0.0, posinf=1e4, neginf=-1e4)
-    # ФИКС (см. lesson #9 / kernel_bwd_b4_intra.py): gc_last = gc[-1] is not
-    # an independent leaf, its contribution must be ADDED into dgc's last
-    # row -- `.at[-1].add()` on a plain value is a scatter-add and does not
-    # lower on Mosaic even with a static index. Explicit ref read-modify-
-    # write instead (load the row just written above, add, store back) --
-    # ordinary load+store, not a scatter primitive.
-    last_row = dgc_ref[0, 0, 0, C - 1:C, :]
-    dgc_ref[0, 0, 0, C - 1:C, :] = jnp.nan_to_num(
-        last_row + dgc_last_contrib[None, :], nan=0.0, posinf=1e4, neginf=-1e4
-    )
 
 
 def wy_dqkg_backward_pallas(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all,
